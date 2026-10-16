@@ -296,6 +296,20 @@ pub struct DispatchMetrics {
     pub index_name: Option<String>,
 }
 
+/// The single-table item operations whose `TableKeyInfo` the auth layer
+/// looks up before dispatch (for `dynamodb:LeadingKeys`) and hands to the
+/// engine in [`OperationContext::pre_fetched_key_info`], or reports missing
+/// in [`OperationContext::key_info_known_missing`]. The server's
+/// authorization path and request handler both key on this list.
+pub const KEY_INFO_PREFETCH_OPERATIONS: [&str; 6] = [
+    "GetItem",
+    "PutItem",
+    "DeleteItem",
+    "UpdateItem",
+    "Query",
+    "Scan",
+];
+
 /// Result of an engine dispatch: the JSON response body plus sideband metrics.
 #[must_use]
 pub struct DispatchResult {
@@ -320,8 +334,8 @@ impl DispatchResult {
 ///
 /// # Catalog Query Discipline (P118)
 ///
-/// For single-table item operations (`GetItem`, `PutItem`, `DeleteItem`,
-/// `UpdateItem`, `Query`, `Scan`), the auth layer pre-fetches `TableKeyInfo`
+/// For single-table item operations ([`KEY_INFO_PREFETCH_OPERATIONS`]), the
+/// auth layer pre-fetches `TableKeyInfo`
 /// and stores it in `pre_fetched_key_info`. Engine handlers MUST use this
 /// pre-fetched value instead of calling `storage.table_key_info()` directly.
 /// New per-request catalog roundtrips require justification in the discussion
@@ -341,6 +355,14 @@ pub struct OperationContext {
     /// Populated for single-table item-level operations; `None` for table-level
     /// and batch/transact operations.
     pub pre_fetched_key_info: Option<extenddb_core::types::TableKeyInfo>,
+    /// The auth layer looked `TableName` up for this single-table item
+    /// operation and found no `ACTIVE` table of that name. Carried here so
+    /// the engine does not load it again: the key-info cache stores nothing
+    /// for a name the catalog has in a non-`ACTIVE` state (a `CREATING`
+    /// restore target), so a second lookup would be a second uncached
+    /// catalog load. `false` whenever `pre_fetched_key_info` is `Some` or
+    /// the auth layer did not look the name up.
+    pub key_info_known_missing: bool,
     /// Auth/authz cache handles. Used by control-plane and tagging operations
     /// to issue write-through cache invalidations after the underlying state
     /// changes (e.g. `TagResource` invalidates the resource-tags cache).
@@ -356,15 +378,23 @@ impl OperationContext {
     /// Return pre-fetched `TableKeyInfo` if available and matching the requested
     /// table, otherwise fetch from storage. This is the single entry point for
     /// obtaining `TableKeyInfo` in engine handlers (P118 Catalog Query Discipline).
+    ///
+    /// When the auth layer already looked the operation's table up and found
+    /// it missing (`key_info_known_missing`), that answer is returned as
+    /// `TableNotFound` without asking the cache or storage again, so a
+    /// request against a `CREATING` name costs one `table_key_info` and one
+    /// `describe_table` in total, both on the auth path.
     pub(crate) async fn table_key_info(
         &self,
         table_name: &str,
     ) -> Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError> {
-        if let Some(ref ki) = self.pre_fetched_key_info
-            && ki.table_name == table_name
-            && *ki.account_id == *self.account_id
-        {
-            return Ok(ki.clone());
+        if let Some(answer) = key_info_without_lookup(
+            self.pre_fetched_key_info.as_ref(),
+            self.key_info_known_missing,
+            &self.account_id,
+            table_name,
+        ) {
+            return answer;
         }
         if let Some(ref lookup) = self.table_key_info_lookup {
             return lookup.lookup(&self.account_id, table_name).await;
@@ -373,6 +403,30 @@ impl OperationContext {
             .table_key_info(&self.account_id, table_name)
             .await
     }
+}
+
+/// The `TableKeyInfo` answer the auth path already produced for this request,
+/// or `None` when the engine has to look the table up: the pre-fetched info
+/// when it is for `table_name` in `account_id`; `TableNotFound` when the auth
+/// path looked `table_name` up and found no `ACTIVE` table of that name.
+fn key_info_without_lookup(
+    pre_fetched: Option<&extenddb_core::types::TableKeyInfo>,
+    known_missing: bool,
+    account_id: &str,
+    table_name: &str,
+) -> Option<Result<extenddb_core::types::TableKeyInfo, extenddb_storage::error::StorageError>> {
+    if let Some(ki) = pre_fetched
+        && ki.table_name == table_name
+        && *ki.account_id == *account_id
+    {
+        return Some(Ok(ki.clone()));
+    }
+    if known_missing {
+        return Some(Err(extenddb_storage::error::StorageError::TableNotFound(
+            table_name.to_owned(),
+        )));
+    }
+    None
 }
 
 /// Dispatch an operation by name.
@@ -473,5 +527,41 @@ pub async fn dispatch(
             .await
             .map(DispatchResult::body_only),
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
+    }
+}
+
+#[cfg(test)]
+mod key_info_tests {
+    use super::key_info_without_lookup;
+    use extenddb_core::types::TableKeyInfo;
+    use extenddb_storage::error::StorageError;
+
+    fn info(account_id: &str, table_name: &str) -> TableKeyInfo {
+        TableKeyInfo {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+            ..TableKeyInfo::default()
+        }
+    }
+
+    /// A name the auth path found missing is answered `TableNotFound` without
+    /// a second lookup; a name it did not look up is looked up.
+    #[test]
+    fn a_name_the_auth_path_found_missing_is_not_looked_up_again() {
+        let answer = key_info_without_lookup(None, true, "1", "Restoring");
+        assert!(
+            matches!(&answer, Some(Err(StorageError::TableNotFound(n))) if n == "Restoring"),
+            "{answer:?}"
+        );
+        assert!(key_info_without_lookup(None, false, "1", "Restoring").is_none());
+    }
+
+    #[test]
+    fn pre_fetched_info_for_the_table_is_used_and_for_another_table_is_not() {
+        let ki = info("1", "Music");
+        let answer = key_info_without_lookup(Some(&ki), false, "1", "Music");
+        assert!(matches!(answer, Some(Ok(k)) if k.table_name == "Music"));
+        assert!(key_info_without_lookup(Some(&ki), false, "1", "Other").is_none());
+        assert!(key_info_without_lookup(Some(&ki), false, "2", "Music").is_none());
     }
 }

@@ -107,7 +107,7 @@ pub(crate) async fn handle_request(
 
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
-    let pre_fetched_key_info;
+    let prefetch;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -137,12 +137,24 @@ pub(crate) async fn handle_request(
         )
         .await
         {
-            Ok(ki) => pre_fetched_key_info = ki,
+            Ok(p) => prefetch = p,
             Err(e) => return error_response(&e, &request_id),
         }
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
+
+    let table_name = extract_table_name(&input);
+    // The auth path looked `TableName` up for the item operations. A name it
+    // found with no ACTIVE table (not in the catalog, or CREATING or
+    // DELETING) is carried to the engine as known missing, so the engine does
+    // not look it up again: the key-info cache stores nothing for a
+    // non-ACTIVE name, so a second lookup would be a second uncached catalog
+    // load for every request against a restore target while it is CREATING.
+    // A lookup that failed with a storage error is not known missing; the
+    // engine looks the name up again and reports what it finds.
+    let pre_fetched_key_info = prefetch.info;
+    let key_info_known_missing = prefetch.known_missing;
 
     // Dispatch
     let ctx = OperationContext {
@@ -153,13 +165,12 @@ pub(crate) async fn handle_request(
         import_paths: state.import_paths.clone(),
         export_paths: state.export_paths.clone(),
         pre_fetched_key_info,
+        key_info_known_missing,
         auth_cache: state.auth_cache.clone(),
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
         ),
     };
-
-    let table_name = extract_table_name(&input);
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
