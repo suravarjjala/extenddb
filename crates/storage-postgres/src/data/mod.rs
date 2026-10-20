@@ -142,5 +142,6 @@ mod update_item;
 pub mod vector_index;
 
 pub(crate) use index::{
-    delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,
+    delete_index_row_multi, insert_index_row_multi, insert_index_row_multi_ignore_conflict,
+    item_has_index_keys, project_item_for_index,
 };
