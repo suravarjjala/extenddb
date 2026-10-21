@@ -201,6 +201,7 @@ impl CassandraEngine {
                     index_name: index_name.clone(),
                     key_schema: ks,
                     projection: proj,
+                    backfilling: None,
                     index_status,
                     provisioned_throughput: pt,
                     index_size_bytes: 0,
