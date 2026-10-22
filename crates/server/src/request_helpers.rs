@@ -5,6 +5,7 @@
 
 use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use extenddb_storage::error::StorageError;
 use serde_json::Value;
 
 use crate::AppState;
@@ -37,8 +38,8 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
 /// Extract the table name from a `DynamoDB` request body.
 ///
 /// Most operations use `TableName`. Batch and transact operations embed table
-/// names in nested structures — returns `None` for those; the caller maps
-/// `None` to `*` via `build_resource_arn`.
+/// names in nested structures, so this returns `None` for those; the caller
+/// maps `None` to `*` via `build_resource_arn`.
 pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
     input
         .get("TableName")
@@ -46,11 +47,51 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Decide how a `TableKeyInfo` lookup result feeds request authorization.
+///
+/// A present table yields its key info. A missing table yields `None`: the
+/// `dynamodb:LeadingKeys` value stays absent and the engine returns
+/// `ResourceNotFoundException`, which is what the service returns for a
+/// LeadingKeys-restricted principal on a missing table (measured 2026-10-20).
+///
+/// Any other lookup failure (connection, transient, backend internal) must not
+/// reach the policy evaluator with the key absent. A
+/// `ForAllValues:StringEquals dynamodb:LeadingKeys` condition is satisfied
+/// vacuously when the key is absent, so a request whose key could not be
+/// determined would be authorized and the engine could then read the real
+/// table on its own lookup. Such a failure returns an error before dispatch, so
+/// no request is ever authorized on a key the server could not determine.
+///
+/// The error is classified by the engine's own `storage_err_to_dynamo`, so the
+/// server and the engine return the same wire error for the same storage fault:
+/// a transient or connection fault is `ServiceUnavailable` (503, SDK-retryable),
+/// the catalog and backend-internal faults are `InternalServerError` (500), and
+/// a not-active table is `ResourceInUseException`. Using one mapper keeps a
+/// database hiccup from returning 503 when the engine hits it and 500 when
+/// authorization hits it first. The cache reports a missing table as
+/// `StorageError::TableNotFound` and every other fault as a distinct error, so
+/// the two are told apart here rather than collapsed to `None`. Every fault
+/// class fails closed: none authorizes the request.
+fn key_info_for_authz(
+    result: Result<extenddb_core::types::TableKeyInfo, StorageError>,
+) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+    match result {
+        Ok(info) => Ok(Some(info)),
+        Err(StorageError::TableNotFound(_)) => Ok(None),
+        Err(e) => Err(extenddb_engine::storage_err_to_dynamo(e)),
+    }
+}
+
 /// Evaluate IAM policies for an authenticated identity.
 ///
-/// Returns the pre-fetched `TableKeyInfo` for single-table item-level operations
-/// (P118 optimization #2). The caller passes this into `OperationContext` to
-/// avoid a redundant catalog roundtrip in the engine layer.
+/// Returns the `TableKeyInfo` authorization read for each table it evaluated,
+/// including a `None` for a table it found missing (P118 optimization #2). The
+/// caller passes this into `OperationContext::authorized_key_info`, and the
+/// engine resolves those tables from it instead of reading the catalog again.
+/// Authorization and the engine therefore act on one snapshot: a table that
+/// authorization saw as missing, and so evaluated with `dynamodb:LeadingKeys`
+/// absent, is missing to the engine for the rest of the request, even if it has
+/// become ACTIVE in between.
 ///
 /// All authorization data is fetched via `state.authz_cache`, which sits on
 /// top of the underlying `AuthorizationStore` and serves cached, pre-parsed
@@ -63,29 +104,26 @@ pub(crate) async fn authorize_request(
     account_id: &str,
     source_ip: Option<&str>,
     user_agent: Option<&str>,
-) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
+) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
     let table_name = extract_table_name(input);
+    let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 
     // P118: Fetch table_key_info for item-level operations via the SWR cache.
     // The result is used for LeadingKeys extraction here AND returned to the
     // caller to avoid a redundant fetch in the engine layer.
-    let key_info = match operation {
-        "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan" => {
-            if let Some(ref tn) = table_name {
-                state
-                    .table_key_info_cache
-                    .get_optional(account_id, tn)
-                    .await
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+    if let Some(ref tn) = table_name
+        && matches!(
+            operation,
+            "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan"
+        )
+    {
+        let ki = key_info_for_authz(state.table_key_info_cache.get(account_id, tn).await)?;
+        authorized_key_info.insert(tn.clone(), ki);
+    }
 
     // Developer mode opens authorization for the authenticated caller. SigV4
     // verification already ran upstream, so the request is authenticated; only
-    // the IAM policy decision is skipped. key_info is still returned so the
+    // the IAM policy decision is skipped. The key info is still returned so the
     // engine layer can reuse it.
     //
     // This check is deliberately positioned ahead of EVERY authorization branch
@@ -95,7 +133,7 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
-        return Ok(key_info);
+        return Ok(authorized_key_info);
     }
 
     // Batch and transaction operations address multiple tables in nested request
@@ -108,13 +146,52 @@ pub(crate) async fn authorize_request(
     // Deny on one table be bypassed. Evaluate every (action, table) pair and
     // reject the entire request if any is denied (all-or-nothing), matching
     // DynamoDB. Verified against the AWS IAM Service Authorization Reference.
-    if let Some(targets) = batch_transact_authz_targets(operation, input) {
-        for (action_op, table) in targets {
-            let resource_arn = build_resource_arn(&state.region, account_id, Some(&table));
+    // `batch_transact_tables` returns `Some` for exactly the batch and
+    // transaction operations. Batch operations authorize once per table with
+    // the set of keys that table receives; transaction operations authorize
+    // once per item with that item's key. Each target carries the
+    // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
+    // table's key schema. The resource ARN per target is unchanged: each is
+    // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
+    // Targets with the same (action, table, LeadingKeys) are evaluated once,
+    // since the decision depends only on those three for a given identity.
+    if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
+        // A request outside the operation's count limits is refused before any
+        // key info is read or any policy is evaluated, with the engine's own
+        // error. DynamoDB does the same: an empty or 101-item transaction, an
+        // empty RequestItems, a table with no keys or requests, more than 100
+        // tables or keys in a BatchGetItem and more than 25 tables or requests
+        // in a BatchWriteItem each return ValidationException, including to a
+        // principal with no permissions (measured 2026-10-21). Checking first
+        // also bounds the tables read and the policies evaluated below by those
+        // limits instead of by the body size. A TransactWriteItems item can name
+        // up to four sub-operations here, each on its own table, before the
+        // handler rejects it, so a transaction reads at most 400 tables.
+        extenddb_engine::check_request_item_counts(operation, input)?;
+
+        // Read each distinct table's key info from storage, not the cache, and
+        // hand what was read to the engine. The engine resolves these tables
+        // from the snapshot, so it never acts on a table authorization saw as
+        // missing, and it sees the catalog as fresh as these handlers always
+        // read it.
+        for table in tables {
+            let ki = key_info_for_authz(state.storage.table_key_info(account_id, &table).await)?;
+            authorized_key_info.insert(table, ki);
+        }
+        let targets =
+            crate::leading_keys::batch_transact_targets(operation, input, &authorized_key_info)
+                .unwrap_or_default();
+
+        if targets.is_empty() {
+            // Malformed body (the count checks above have already refused an
+            // empty one): still require the operation's action on the table
+            // wildcard, as the generic path would, then let the engine reject
+            // the body. This never silently skips authorization.
+            let resource_arn = build_resource_arn(&state.region, account_id, None);
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                &action_op,
+                operation,
                 &resource_arn,
                 false,
                 extenddb_auth::policy::context::RequestParams {
@@ -126,18 +203,45 @@ pub(crate) async fn authorize_request(
                 },
             )
             .await?;
+        } else {
+            for target in targets {
+                let resource_arn =
+                    build_resource_arn(&state.region, account_id, Some(&target.table));
+                let params = extenddb_auth::policy::context::RequestParams {
+                    leading_keys: target.leading_keys,
+                    region: Some(state.region.to_string()),
+                    secure_transport: state.tls_enabled,
+                    source_ip: source_ip.map(ToOwned::to_owned),
+                    user_agent: user_agent.map(ToOwned::to_owned),
+                    ..Default::default()
+                };
+                authorization::check_authorization(
+                    state.authz_cache.as_ref(),
+                    identity,
+                    &target.action,
+                    &resource_arn,
+                    false,
+                    params,
+                )
+                .await?;
+            }
         }
-        return Ok(None);
+        return Ok(authorized_key_info);
     }
 
     let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
-
-    let pk_attr = key_info
+    let key_info = table_name
         .as_ref()
-        .map(|ki| ki.key_schema[0].attribute_name.clone());
+        .and_then(|tn| authorized_key_info.get(tn))
+        .and_then(Option::as_ref);
 
     let params = extenddb_auth::policy::context::RequestParams {
-        leading_keys: extract_leading_keys(input, operation, pk_attr.as_deref()),
+        leading_keys: crate::leading_keys::single_table_leading_keys(
+            input,
+            operation,
+            key_info,
+            state.limits.max_expression_tokens,
+        ),
         attributes: extract_attributes(input),
         select: input
             .get("Select")
@@ -167,43 +271,7 @@ pub(crate) async fn authorize_request(
     )
     .await?;
 
-    Ok(key_info)
-}
-
-/// Extract partition key values from the request body for `dynamodb:LeadingKeys`.
-///
-/// For item-level operations (`GetItem`, `PutItem`, `DeleteItem`, `UpdateItem`),
-/// extracts the partition key value from the `Key` or `Item` using the table's
-/// key schema. For `Query`, the leading key comes from `KeyConditionExpression`
-/// values, but extracting that requires expression parsing — deferred to the
-/// engine layer.
-/// Returns `None` for table-level and batch/transact operations, or when
-/// `pk_attr` is not available.
-fn extract_leading_keys(
-    input: &Value,
-    operation: &str,
-    pk_attr: Option<&str>,
-) -> Option<Vec<String>> {
-    let pk_attr = pk_attr?;
-    match operation {
-        "GetItem" | "DeleteItem" | "UpdateItem" => extract_pk_value(input.get("Key")?, pk_attr),
-        "PutItem" => extract_pk_value(input.get("Item")?, pk_attr),
-        _ => None,
-    }
-}
-
-/// Extract the partition key value from a `DynamoDB` key/item map using the
-/// known PK attribute name.
-///
-/// `DynamoDB` keys are `{"attrName": {"S": "value"}}`. We extract the typed
-/// value of the partition key attribute as a string.
-fn extract_pk_value(map: &Value, pk_attr: &str) -> Option<Vec<String>> {
-    let obj = map.as_object()?;
-    let type_val = obj.get(pk_attr)?;
-    let type_obj = type_val.as_object()?;
-    let (_, val) = type_obj.iter().next()?;
-    let s = val.as_str().unwrap_or_default();
-    Some(vec![s.to_owned()])
+    Ok(authorized_key_info)
 }
 
 /// Extract attribute names from the request for `dynamodb:Attributes`.
@@ -231,69 +299,6 @@ pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
     if names.is_empty() { None } else { Some(names) }
 }
 
-/// IAM `(action, table)` pairs to authorize for a batch/transact operation.
-///
-/// Returns `None` for non-batch/transact operations (the caller uses the
-/// single-table path). Actions follow the AWS IAM Service Authorization
-/// Reference: `BatchGetItem`/`BatchWriteItem` authorize under their own action
-/// per table; `TransactGetItems` authorizes as `GetItem` per item's table;
-/// `TransactWriteItems` authorizes per sub-op (`Put`→`PutItem`,
-/// `Delete`→`DeleteItem`, `Update`→`UpdateItem`, `ConditionCheck`→
-/// `ConditionCheckItem`). Pairs are de-duplicated. Table names are the bare
-/// operation-string form (no `dynamodb:` prefix), matching `check_authorization`
-/// which prepends `dynamodb:`.
-fn batch_transact_authz_targets(operation: &str, input: &Value) -> Option<Vec<(String, String)>> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut push = |action: &str, table: &str| {
-        let pair = (action.to_owned(), table.to_owned());
-        if !out.contains(&pair) {
-            out.push(pair);
-        }
-    };
-    match operation {
-        "BatchGetItem" | "BatchWriteItem" => {
-            // RequestItems is a map keyed by table name.
-            let items = input.get("RequestItems")?.as_object()?;
-            for table in items.keys() {
-                push(operation, table);
-            }
-        }
-        "TransactGetItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            for entry in items {
-                if let Some(t) = entry
-                    .get("Get")
-                    .and_then(|g| g.get("TableName"))
-                    .and_then(Value::as_str)
-                {
-                    push("GetItem", t);
-                }
-            }
-        }
-        "TransactWriteItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            for entry in items {
-                for (sub, action) in [
-                    ("Put", "PutItem"),
-                    ("Delete", "DeleteItem"),
-                    ("Update", "UpdateItem"),
-                    ("ConditionCheck", "ConditionCheckItem"),
-                ] {
-                    if let Some(t) = entry
-                        .get(sub)
-                        .and_then(|s| s.get("TableName"))
-                        .and_then(Value::as_str)
-                    {
-                        push(action, t);
-                    }
-                }
-            }
-        }
-        _ => return None,
-    }
-    Some(out)
-}
-
 /// Build a `DynamoDB` table ARN for authorization.
 ///
 /// If no table name is available (e.g. `ListTables`, `DescribeEndpoints`),
@@ -308,7 +313,84 @@ fn build_resource_arn(region: &str, account_id: &str, table_name: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::types::TableKeyInfo;
     use serde_json::json;
+
+    fn sample_key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "t".to_owned(),
+            account_id: "123".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn key_info_for_authz_present_table_returns_key_info() {
+        let out =
+            key_info_for_authz(Ok(sample_key_info())).expect("a present table is not an error");
+        assert!(out.is_some(), "a present table must yield its key info");
+    }
+
+    #[test]
+    fn key_info_for_authz_missing_table_returns_none() {
+        let out = key_info_for_authz(Err(StorageError::TableNotFound("t".to_owned())))
+            .expect("a missing table is not a lookup failure");
+        assert!(
+            out.is_none(),
+            "a missing table must leave the leading key absent so the engine returns not-found"
+        );
+    }
+
+    #[test]
+    fn key_info_for_authz_lookup_error_fails_closed() {
+        // Each non-not-found fault fails closed, classified the same way the
+        // engine classifies it: transient and connection faults are retryable
+        // 503s, the catalog and backend-internal faults are 500s, and a
+        // not-active table is the engine's ResourceInUseException. None yields
+        // an Ok(Some)/Ok(None) that would authorize the request.
+        let service_unavailable = [
+            StorageError::Transient("db hiccup".to_owned()),
+            StorageError::Connection("pool timeout".to_owned()),
+        ];
+        for err in service_unavailable {
+            let out = key_info_for_authz(Err(err.clone()));
+            assert!(
+                matches!(out, Err(DynamoDbError::ServiceUnavailable(_))),
+                "a transient or connection fault must map to ServiceUnavailable, got: {out:?} for {err:?}"
+            );
+        }
+
+        let internal = [
+            StorageError::Internal("backend fault".to_owned()),
+            StorageError::CatalogVersionMismatch {
+                expected: "3".to_owned(),
+                found: "2".to_owned(),
+            },
+            StorageError::CatalogNotInitialized,
+        ];
+        for err in internal {
+            let out = key_info_for_authz(Err(err.clone()));
+            assert!(
+                matches!(out, Err(DynamoDbError::InternalServerError(_))),
+                "a catalog or backend-internal fault must map to InternalServerError, got: {out:?} for {err:?}"
+            );
+        }
+
+        // TableNotActive maps to whatever the engine maps it to, so the server
+        // and the engine agree on a not-active table. It still fails closed (an
+        // Err, not an authorizing Ok).
+        let out = key_info_for_authz(Err(StorageError::TableNotActive("t".to_owned())));
+        let engine =
+            extenddb_engine::storage_err_to_dynamo(StorageError::TableNotActive("t".to_owned()));
+        assert!(
+            matches!(out, Err(ref e) if std::mem::discriminant(e) == std::mem::discriminant(&engine)),
+            "TableNotActive must map to the engine's error class ({engine:?}), got: {out:?}"
+        );
+        assert!(
+            matches!(engine, DynamoDbError::ResourceInUseException(_)),
+            "the engine maps TableNotActive to ResourceInUseException, got: {engine:?}"
+        );
+    }
 
     #[test]
     fn extract_attributes_resolves_expression_attribute_names() {
