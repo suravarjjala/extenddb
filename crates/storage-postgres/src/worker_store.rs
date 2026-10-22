@@ -127,42 +127,12 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // P54 Bug 1: Drop data tables on the data pool after catalog commit.
+        // Drop data tables on the data pool after catalog commit. See
+        // `drop_table_storage` for why the queue is stopped before anything is
+        // dropped.
         for (table_id, index_ids, vector_index_ids) in &drop_info {
-            let mut data_tx = self
-                .data_pool
-                .begin()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            for idx_id in index_ids {
-                Self::drop_index_data_table(&mut data_tx, idx_id).await?;
-            }
-            for idx_id in vector_index_ids {
-                Self::drop_vector_data_table(&mut data_tx, idx_id).await?;
-            }
-            Self::drop_data_table(&mut data_tx, table_id).await?;
-
-            // Drop any still-pending GSI propagation rows for this table in the
-            // same transaction that drops the tables, so workers don't waste a
-            // claim→deserialize→attempt→skip cycle on now-orphaned rows.
-            sqlx::query("DELETE FROM gsi_pending WHERE table_id = $1")
-                .bind(table_id)
-                .execute(&mut *data_tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            // And any vector build hold: the table is gone, so nothing will ever
-            // release it, and a stale hold blocks claims for that table id.
-            sqlx::query("DELETE FROM vector_index_holds WHERE table_id = $1")
-                .bind(table_id)
-                .execute(&mut *data_tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            data_tx
-                .commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            Self::drop_table_storage(&self.data_pool, table_id, index_ids, vector_index_ids)
+                .await?;
         }
 
         Ok(transitions)
