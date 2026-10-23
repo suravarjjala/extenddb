@@ -528,6 +528,102 @@ absent, as the service leaves it unset for a non-MFA session. Like
 request path only; in a trust policy it is absent, as on the service for an
 `AssumeRole` caller using long-term credentials.
 
+### Resource-level authorization
+
+Every operation is authorized against the specific resource ARN, matching
+DynamoDB. The `Resource` element of a policy is matched field by field, and a
+`*` or `?` in the resource part of the ARN spans the `:` and `/` inside it.
+
+| Operation | Resource ARN authorized |
+|-----------|-------------------------|
+| Item and table operations (GetItem, PutItem, Query and Scan on the base table, CreateTable, UpdateTable, DescribeTable, and so on) | `table/<name>` |
+| Query and Scan with an `IndexName` | `table/<name>/index/<index>` |
+| TagResource, UntagResource, ListTagsOfResource | the `ResourceArn` (a table or stream ARN) |
+| DescribeStream, GetShardIterator | the `StreamArn` |
+| GetRecords | the stream the shard iterator reads |
+| ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
+| DescribeBackup, DeleteBackup | the `BackupArn` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| ExportTableToPointInTime | the source `table/<name>` |
+| ImportTable | the new `table/<name>` |
+| RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
+| RestoreTableToPointInTime | the source `table/<name>`, plus the same item actions on the target `table/<name>` |
+| ListTables | `table/*` |
+| DescribeLimits | `*` |
+| DescribeEndpoints | not authorized (signed request, no IAM permission) |
+
+A policy that names another partition, service, region, or account in a
+resource ARN it supplies (for example on a stream or backup operation) cannot
+evade a Deny written against the real resource: the resource is resolved in this
+deployment's account regardless of those fields.
+
+#### Compatibility notes
+
+Earlier builds authorized several of these operations against
+`table/*` instead of the specific resource. Review existing policies before
+upgrading:
+
+- **Index reads.** Query and Scan with an `IndexName` are authorized against
+  `table/<name>/index/<index>`. A policy that granted a principal only
+  `table/<name>` no longer allows reads of that table's indexes. Grant
+  `table/<name>/index/<index>` or `table/<name>/index/*` as needed. This
+  matches DynamoDB.
+- **Fencing a whole table with a Deny.** Index reads, `ListStreams` with a
+  TableName, and `ListBackups` with a TableName are authorized against a
+  sub-resource ARN (`table/<name>/index/*`, `table/<name>/stream/*`,
+  `table/<name>/backup/*`), not the bare `table/<name>`. A `Deny` written only
+  on `table/<name>` therefore does not cover them. An operator who means to
+  fence a whole table adds `table/<name>/*` to the `Deny` alongside
+  `table/<name>`.
+- **Index reads and resource tags.** An index Query or Scan evaluates the base
+  table's resource tags (`aws:ResourceTag/*`; `dynamodb:ResourceTag/*` is
+  absent for every resource),
+  because a secondary index inherits the tags of its table. An ABAC `Deny` or
+  `Allow` conditioned on the table's tags applies to its indexes.
+- **Streams, backups, and resource tags.** An operation on a stream ARN
+  (DescribeStream, GetShardIterator, GetRecords, and a tag operation on the
+  stream) and an operation on a backup ARN evaluate no resource tags, as on
+  DynamoDB: `aws:ResourceTag/*` and `dynamodb:ResourceTag/*` are absent. A
+  stream holds a tag set of its own, separate from its table's, but neither set
+  is evaluated for the stream's operations. A condition on the key evaluates as
+  for an absent key: `StringEquals` and `StringLike` do not match, while a
+  negated operator, an `IfExists` form, `ForAllValues`, and `Null` true do. A
+  backup ARN cannot be tagged.
+- **DescribeLimits and DescribeEndpoints.** DescribeLimits is authorized against
+  `*`, not `table/*`, so a grant or a `Deny` scoped to `table/*` no longer
+  applies to it; scope its statement to `*`. DescribeEndpoints is not evaluated
+  against IAM at all (it needs a signed request but no permission), so a `Deny`
+  on it does not block it, matching DynamoDB.
+- **Streams.** A policy whose resource is `table/<name>/stream/*` now matches
+  concrete stream ARNs (the stream label contains `:`, which the resource
+  wildcard now spans). A Deny on a specific stream ARN, or on a tag, backup, or
+  index ARN, now takes effect where before it was bypassed.
+- **GetRecords.** GetRecords is authorized against the stream its shard iterator
+  reads, so a principal needs `dynamodb:GetRecords` on that stream. A shard
+  iterator issued by a build before this change does not identify its stream;
+  after upgrade, GetRecords on such an iterator returns
+  `ExpiredIteratorException` with the expiry message, so a stream client renews
+  it by calling GetShardIterator rather than failing on a non-retryable error.
+  This matters during the upgrade itself: a consumer reading when the server
+  restarts holds a pre-upgrade iterator, and its iterator chain renews cleanly
+  instead of stalling. A token that does not decode at all still returns
+  `ValidationException` with the message `Invalid ShardIterator`, which is what
+  DynamoDB returns for an iterator it did not issue. Shard iterators expire after
+  15 minutes.
+- **Restores.** A restore writes items into its target table, so
+  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
+  and read actions on the target table in addition to the restore action. A
+  principal that could previously restore with only the restore permission now
+  also needs those actions on the target table name.
+- **Denial messages.** An AccessDeniedException now ends with the clause the
+  service uses: "with an explicit deny in an identity-based policy" when an
+  explicit Deny matched the request, or "because no identity-based policy allows
+  the <action> action" otherwise. Earlier builds returned the common prefix with
+  no trailing clause and did not distinguish the two cases. The error code is
+  unchanged, so a client that checks the code or the substring "is not
+  authorized to perform" is unaffected; tooling that matched the full message
+  text verbatim will see the new clause.
+
 ### Permissions Boundaries
 
 ```bash

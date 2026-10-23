@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::AppState;
 use crate::authorization;
+use crate::authz_resource;
 
 /// Extract operation name from X-Amz-Target header.
 /// Accepts both `DynamoDB_20120810` and `DynamoDBStreams_20120810` wire-format prefixes.
@@ -35,11 +36,13 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
         .ok_or_else(|| DynamoDbError::UnknownOperationException(String::new()))
 }
 
-/// Extract the table name from a `DynamoDB` request body.
+/// Extract the top-level `TableName` from a request body.
 ///
-/// Most operations use `TableName`. Batch and transact operations embed table
-/// names in nested structures, so this returns `None` for those; the caller
-/// maps `None` to `*` via `build_resource_arn`.
+/// Used to pre-fetch table key info for item operations. Batch and transact
+/// operations embed table names in nested structures and carry no top-level
+/// `TableName`, so this returns `None` for them. The authorization resource is
+/// derived separately by `authz_resource::authz_targets`, which never falls
+/// back to a `table/*` wildcard.
 pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
     input
         .get("TableName")
@@ -108,17 +111,30 @@ pub(crate) async fn authorize_request(
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 
+    // TableName may be a table ARN. dynamodb:LeadingKeys and the other item
+    // condition keys are read with the table's key schema, so key info is
+    // looked up by the table name the ARN names (this account and region only).
+    // Without this, the lookup misses, LeadingKeys is absent, and a
+    // ForAllValues condition is satisfied vacuously. The key info found this
+    // way is used for authorization only and is not put in the snapshot handed
+    // to the engine, which resolves the request's TableName itself as before.
+    let named_by_arn = table_name.as_deref().is_some_and(|t| t.starts_with("arn:"));
+
     // P118: Fetch table_key_info for item-level operations via the SWR cache.
     // The result is used for LeadingKeys extraction here AND returned to the
     // caller to avoid a redundant fetch in the engine layer.
+    let mut key_info = None;
     if let Some(ref tn) = table_name
         && matches!(
             operation,
             "GetItem" | "PutItem" | "DeleteItem" | "UpdateItem" | "Query" | "Scan"
         )
     {
-        let ki = key_info_for_authz(state.table_key_info_cache.get(account_id, tn).await)?;
-        authorized_key_info.insert(tn.clone(), ki);
+        let lookup = authz_resource::key_lookup_name(tn, &state.region, account_id);
+        key_info = key_info_for_authz(state.table_key_info_cache.get(account_id, &lookup).await)?;
+        if !named_by_arn {
+            authorized_key_info.insert(tn.clone(), key_info.clone());
+        }
     }
 
     // Developer mode opens authorization for the authenticated caller. SigV4
@@ -133,6 +149,88 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
+        return Ok(authorized_key_info);
+    }
+
+    // Request-level condition keys every evaluation below carries: the
+    // deployment region, aws:SecureTransport, aws:SourceIp and aws:UserAgent.
+    let base_params = || extenddb_auth::policy::context::RequestParams {
+        region: Some(state.region.to_string()),
+        secure_transport: state.tls_enabled,
+        source_ip: source_ip.map(ToOwned::to_owned),
+        user_agent: user_agent.map(ToOwned::to_owned),
+        ..Default::default()
+    };
+
+    // DescribeEndpoints needs a signed request (SigV4 verification already ran
+    // upstream) but no IAM permission, as on DynamoDB: a caller with no policy,
+    // or with an explicit Deny on dynamodb:DescribeEndpoints or dynamodb:*, gets
+    // the endpoint list (measured 2026-10-20).
+    if operation == "DescribeEndpoints" {
+        return Ok(authorized_key_info);
+    }
+
+    // Tag operations validate the ResourceArn shape before the IAM decision, as
+    // the service does: an index ARN (tags are accepted only on a table or
+    // stream) is rejected with ValidationException for every principal, before
+    // authorization. A table or stream ARN passes; its account, region, and
+    // existence are checked after authorization by the engine tag handler.
+    if matches!(
+        operation,
+        "TagResource" | "UntagResource" | "ListTagsOfResource"
+    ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
+        && !arn.is_empty()
+    {
+        authz_resource::validate_tag_resource_arn_shape(arn)?;
+    }
+
+    // Every other ARN-bearing field (StreamArn, BackupArn, the export TableArn,
+    // a restore SourceTableArn) must parse to the resource kind the operation
+    // takes, or the request is refused with ValidationException before the IAM
+    // decision. Without this, an ARN the engine resolves one way and
+    // authorization reads another lets a Deny on the real resource be bypassed.
+    authz_resource::validate_operation_arns(operation, input)?;
+
+    // GetRecords carries its resource only inside the opaque shard iterator, not
+    // in a request body field. Decode the iterator for the stream ARN and
+    // authorize against that specific stream, as the service does. The engine
+    // separately confirms the shard belongs to that stream before reading, so a
+    // token that names an allowed stream but a different stream's shard reads
+    // nothing.
+    //
+    // A token that does not decode, or decodes to neither a current token nor
+    // the pre-upgrade shape, is rejected with ValidationException "Invalid
+    // ShardIterator" before authorization. A pre-upgrade token (the four
+    // pre-stream-ARN fields with a parseable timestamp) is answered with
+    // ExpiredIteratorException before authorization, so a consumer reading
+    // across the upgrade renews its iterator instead of failing on the
+    // non-retryable "Invalid ShardIterator". The service answers an iterator it
+    // did not issue the same way whatever the caller's policy (measured
+    // 2026-10-20).
+    if operation == "GetRecords" {
+        let resource_arn =
+            match authz_resource::getrecords_resource(input, &state.region, account_id) {
+                authz_resource::GetRecordsResource::Stream(arn) => arn,
+                authz_resource::GetRecordsResource::Expired => {
+                    return Err(DynamoDbError::ExpiredIteratorException(
+                        extenddb_engine::SHARD_ITERATOR_EXPIRED_MESSAGE.to_owned(),
+                    ));
+                }
+                authz_resource::GetRecordsResource::Invalid => {
+                    return Err(DynamoDbError::ValidationException(
+                        "Invalid ShardIterator".to_owned(),
+                    ));
+                }
+            };
+        authorization::check_authorization(
+            state.authz_cache.as_ref(),
+            identity,
+            "GetRecords",
+            &resource_arn,
+            false,
+            base_params(),
+        )
+        .await?;
         return Ok(authorized_key_info);
     }
 
@@ -173,7 +271,10 @@ pub(crate) async fn authorize_request(
         // hand what was read to the engine. The engine resolves these tables
         // from the snapshot, so it never acts on a table authorization saw as
         // missing, and it sees the catalog as fresh as these handlers always
-        // read it.
+        // read it. A table named by ARN is read under that ARN string, which
+        // the catalog does not hold, so it is recorded as missing: LeadingKeys
+        // stays absent for it, and the engine answers ResourceNotFound from the
+        // same snapshot instead of resolving the ARN to the real table.
         for table in tables {
             let ki = key_info_for_authz(state.storage.table_key_info(account_id, &table).await)?;
             authorized_key_info.insert(table, ki);
@@ -187,33 +288,27 @@ pub(crate) async fn authorize_request(
             // empty one): still require the operation's action on the table
             // wildcard, as the generic path would, then let the engine reject
             // the body. This never silently skips authorization.
-            let resource_arn = build_resource_arn(&state.region, account_id, None);
+            let resource_arn = authz_resource::table_wildcard(&state.region, account_id);
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
                 operation,
                 &resource_arn,
                 false,
-                extenddb_auth::policy::context::RequestParams {
-                    region: Some(state.region.to_string()),
-                    secure_transport: state.tls_enabled,
-                    source_ip: source_ip.map(ToOwned::to_owned),
-                    user_agent: user_agent.map(ToOwned::to_owned),
-                    ..Default::default()
-                },
+                base_params(),
             )
             .await?;
         } else {
             for target in targets {
+                // The RequestItems key (or TransactItems TableName) may be a
+                // bare name or a table ARN; canonicalize either to this
+                // deployment's table ARN so a respelled ARN cannot evade a
+                // per-table Deny.
                 let resource_arn =
-                    build_resource_arn(&state.region, account_id, Some(&target.table));
+                    authz_resource::table_resource_arn(&target.table, &state.region, account_id);
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
-                    region: Some(state.region.to_string()),
-                    secure_transport: state.tls_enabled,
-                    source_ip: source_ip.map(ToOwned::to_owned),
-                    user_agent: user_agent.map(ToOwned::to_owned),
-                    ..Default::default()
+                    ..base_params()
                 };
                 authorization::check_authorization(
                     state.authz_cache.as_ref(),
@@ -229,47 +324,65 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    let resource_arn = build_resource_arn(&state.region, account_id, table_name.as_deref());
-    let key_info = table_name
-        .as_ref()
-        .and_then(|tn| authorized_key_info.get(tn))
-        .and_then(Option::as_ref);
+    // Derive the (action, resource ARN) pairs the service authorizes this
+    // operation against. The resource comes from the field the operation
+    // actually carries it in (ResourceArn, StreamArn, BackupArn, TableArn,
+    // IndexName, or a table ARN in TableName), canonicalized to this
+    // deployment, never a `table/*` fallback. See `authz_resource`.
+    let targets = authz_resource::authz_targets(operation, input, &state.region, account_id);
+    let is_scan = operation == "Scan";
 
-    let params = extenddb_auth::policy::context::RequestParams {
-        leading_keys: crate::leading_keys::single_table_leading_keys(
-            input,
-            operation,
-            key_info,
-            state.limits.max_expression_tokens,
-        ),
-        attributes: extract_attributes(input),
-        select: input
-            .get("Select")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        return_values: input
-            .get("ReturnValues")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        return_consumed_capacity: input
-            .get("ReturnConsumedCapacity")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned),
-        region: Some(state.region.to_string()),
-        secure_transport: state.tls_enabled,
-        source_ip: source_ip.map(ToOwned::to_owned),
-        user_agent: user_agent.map(ToOwned::to_owned),
-        ..Default::default()
-    };
-    authorization::check_authorization(
-        state.authz_cache.as_ref(),
-        identity,
-        operation,
-        &resource_arn,
-        operation == "Scan",
-        params,
-    )
-    .await?;
+    if targets.len() == 1 {
+        // Single-resource operations carry the request params the policy engine
+        // reads for item-level condition keys.
+        let params = extenddb_auth::policy::context::RequestParams {
+            leading_keys: crate::leading_keys::single_table_leading_keys(
+                input,
+                operation,
+                key_info.as_ref(),
+                state.limits.max_expression_tokens,
+            ),
+            attributes: extract_attributes(input),
+            select: input
+                .get("Select")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            return_values: input
+                .get("ReturnValues")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            return_consumed_capacity: input
+                .get("ReturnConsumedCapacity")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+            ..base_params()
+        };
+        let (action, resource_arn) = &targets[0];
+        authorization::check_authorization(
+            state.authz_cache.as_ref(),
+            identity,
+            action,
+            resource_arn,
+            is_scan,
+            params,
+        )
+        .await?;
+    } else {
+        // Multi-permission operations (restore). Each pair is authorized with
+        // the request-level params; a Deny on any required resource fails the
+        // request.
+        for (action, resource_arn) in &targets {
+            authorization::check_authorization(
+                state.authz_cache.as_ref(),
+                identity,
+                action,
+                resource_arn,
+                false,
+                base_params(),
+            )
+            .await?;
+        }
+    }
 
     Ok(authorized_key_info)
 }
@@ -297,17 +410,6 @@ pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
         })
         .collect();
     if names.is_empty() { None } else { Some(names) }
-}
-
-/// Build a `DynamoDB` table ARN for authorization.
-///
-/// If no table name is available (e.g. `ListTables`, `DescribeEndpoints`),
-/// uses `*` as the resource.
-fn build_resource_arn(region: &str, account_id: &str, table_name: Option<&str>) -> String {
-    match table_name {
-        Some(name) => format!("arn:aws:dynamodb:{region}:{account_id}:table/{name}"),
-        None => format!("arn:aws:dynamodb:{region}:{account_id}:table/*"),
-    }
 }
 
 #[cfg(test)]
